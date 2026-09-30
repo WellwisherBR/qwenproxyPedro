@@ -259,6 +259,7 @@ function addIdleTimeoutToStream(
   label: string,
   onTimeout?: () => void,
   onDone?: () => void,
+  onActivity?: () => void,
 ): ReadableStream<Uint8Array> {
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
@@ -270,6 +271,7 @@ function addIdleTimeoutToStream(
   };
 
   const resetIdleTimer = () => {
+    onActivity?.();
     clearIdleTimer();
     idleTimer = setTimeout(() => {
       const message = `${label} idle timeout after ${idleTimeoutMs}ms without upstream data`;
@@ -602,7 +604,7 @@ export async function createQwenStream(
   // Reserve a concurrency slot for the real account. All lanes share one
   // budget, so requests queue here (up to the configured wait) instead of
   // hammering the Qwen backend and tripping its per-account rate limits.
-  const releaseAccountStream = await acquireAccountStreamSlot(streamLockKey, getRuntimeInt('ACCOUNT_STREAM_SLOT_WAIT_MS', config.accounts.streamSlotWaitMs));
+  const accountSlot = await acquireAccountStreamSlot(streamLockKey, getRuntimeInt('ACCOUNT_STREAM_SLOT_WAIT_MS', config.accounts.streamSlotWaitMs));
   let accountStreamReleased = false;
 
   let sessionLocked = false;
@@ -616,7 +618,7 @@ export async function createQwenStream(
   const releaseAccountStreamOnce = () => {
     if (accountStreamReleased) return;
     accountStreamReleased = true;
-    releaseAccountStream();
+    accountSlot.release();
   };
 
   const releaseSessionBusy = () => {
@@ -656,6 +658,7 @@ export async function createQwenStream(
         onTimeout?.();
         releaseStreamResources();
       },
+      () => accountSlot.touch(),
     );
   };
 
