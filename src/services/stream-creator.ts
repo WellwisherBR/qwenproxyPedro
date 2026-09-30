@@ -659,6 +659,7 @@ export async function createQwenStream(
     );
   };
 
+  try {
   const payloadPrompt = useEconomical && options?.economicalPrompt ? options.economicalPrompt : prompt;
   const LARGE_PROMPT_THRESHOLD = config.largePromptThreshold;
   const needsFileUpload = Buffer.byteLength(payloadPrompt, 'utf-8') > LARGE_PROMPT_THRESHOLD && !config.largePromptInline;
@@ -899,7 +900,6 @@ export async function createQwenStream(
     }
   }
 
-  try {
     const timestamp = Math.floor(Date.now() / 1000);
     const fid = crypto.randomUUID();
     const model = modelId.replace('-no-thinking', '').replace('-thinking', '');

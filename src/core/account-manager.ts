@@ -4,6 +4,7 @@ import { config } from './config.js'
 import { getBaseAccountId, makeAccountLaneId } from './account-lanes.js'
 import { RetryableQwenStreamError } from '../services/error-handler.js'
 import { getRuntimeInt } from './runtime-config.js'
+import { metrics } from './metrics.js'
 
 let currentIndex = 0
 const inUseAccounts = new Set<string>()
@@ -169,7 +170,10 @@ export function getReadyAccountCount(): number {
   return readyAccounts.size
 }
 
-const accountLoad = new Map<string, number>()
+// Start timestamps of the active slots per base account. Keeping the ages (not
+// just a count) lets the stale-slot sweeper tell a genuinely long-running stream
+// apart from a slot whose owner died without ever releasing it.
+const accountLoad = new Map<string, number[]>()
 let freeListeners: Array<() => void> = []
 
 function emitAccountFreed(): void {
@@ -183,16 +187,21 @@ function emitAccountFreed(): void {
 export function markAccountStreamStart(accountId: string): void {
   if (!accountId) return
   const base = getBaseAccountId(accountId) || accountId
-  accountLoad.set(base, (accountLoad.get(base) ?? 0) + 1)
+  const starts = accountLoad.get(base)
+  if (starts) starts.push(Date.now())
+  else accountLoad.set(base, [Date.now()])
 }
 
 /** Called when a stream ends or fails; wakes a drained waiter. */
 export function markAccountStreamEnd(accountId: string): void {
   if (!accountId) return
   const base = getBaseAccountId(accountId) || accountId
-  const load = (accountLoad.get(base) ?? 1) - 1
-  if (load <= 0) accountLoad.delete(base)
-  else accountLoad.set(base, load)
+  const starts = accountLoad.get(base)
+  if (starts && starts.length > 0) {
+    starts.shift()
+    if (starts.length === 0) accountLoad.delete(base)
+    else accountLoad.set(base, starts)
+  }
   emitAccountFreed()
 }
 
@@ -200,7 +209,42 @@ export function markAccountStreamEnd(accountId: string): void {
 export function getAccountActiveLoad(accountId?: string): number {
   if (!accountId) return 0
   const base = getBaseAccountId(accountId) || accountId
-  return accountLoad.get(base) ?? 0
+  return accountLoad.get(base)?.length ?? 0
+}
+
+// A slot can only be held legitimately while its stream is producing data; the
+// idle timeout in stream-creator kills a silent stream after ~timeouts.chat /
+// timeouts.streamIdle. Anything held far past that window is a leak (an owner
+// that threw, aborted or vanished without releasing), and would otherwise keep
+// the account permanently "full" while serving nothing.
+const MAX_SLOT_AGE_MS = 30 * 60 * 1000
+
+/** Force-releases slots that outlived any plausible stream; wakes their waiters. */
+export function sweepStaleAccountSlots(now = Date.now()): number {
+  let swept = 0
+  for (const [base, starts] of accountLoad.entries()) {
+    const alive = starts.filter(ts => now - ts <= MAX_SLOT_AGE_MS)
+    const dropped = starts.length - alive.length
+    if (dropped <= 0) continue
+    console.warn(`[AccountManager] Force-released ${dropped} stale stream slot(s) for account ${base} (held > ${Math.round(MAX_SLOT_AGE_MS / 1000)}s)`)
+    metrics.increment('accounts.stale_slots_swept', dropped)
+    if (alive.length === 0) accountLoad.delete(base)
+    else accountLoad.set(base, alive)
+    swept += dropped
+  }
+  if (swept > 0) emitAccountFreed()
+  return swept
+}
+
+if (typeof setInterval !== 'undefined') {
+  const sweepTimer = setInterval(() => {
+    try {
+      sweepStaleAccountSlots()
+    } catch (err: any) {
+      console.warn('[AccountManager] Stale slot sweep failed:', err?.message)
+    }
+  }, 60000)
+  if (sweepTimer.unref) sweepTimer.unref()
 }
 
 /** Resolves the next time any account slot frees (replaces blind polling). */
@@ -232,7 +276,7 @@ export async function acquireAccountStreamSlot(accountId: string, timeoutMs: num
   const waitStart = Date.now()
 
   for (;;) {
-    const load = accountLoad.get(base) ?? 0
+    const load = accountLoad.get(base)?.length ?? 0
     if (load < limit) {
       markAccountStreamStart(base)
       let released = false

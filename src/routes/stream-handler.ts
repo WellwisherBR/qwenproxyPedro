@@ -79,6 +79,19 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
     let guardActive = !!ctx.onDegenerateRetry || !!ctx.onToolCallRetry || !!ctx.onUpdateMemberRetry;
     let heldOutput = '';
 
+    let activeStream: ReadableStream | null = ctx.stream;
+    const clientSignal = (c.req.raw as any)?.signal as AbortSignal | undefined;
+    const releaseActiveStream = (reason: string) => {
+      const s = activeStream;
+      activeStream = null;
+      s?.cancel(reason).catch(() => {});
+    };
+    const onClientAbort = () => releaseActiveStream('client aborted stream');
+    if (clientSignal) {
+      if (clientSignal.aborted) queueMicrotask(onClientAbort);
+      else clientSignal.addEventListener('abort', onClientAbort, { once: true });
+    }
+
     const releaseGuard = () => {
       if (!guardActive) return;
       guardActive = false;
@@ -438,6 +451,7 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
         if (retried) {
           ctx.uiSessionId = retried.uiSessionId;
           resetStreamState();
+          activeStream = retried.stream;
           await readUpstream(retried.stream);
           if (toolParser?.isInsideTool()) sawToolCallSignal = true;
         }
@@ -462,6 +476,7 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
         if (retried) {
           ctx.uiSessionId = retried.uiSessionId;
           resetStreamState();
+          activeStream = retried.stream;
           await readUpstream(retried.stream);
           if (toolParser?.isInsideTool()) sawToolCallSignal = true;
         }
@@ -482,6 +497,7 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
         if (retried) {
           ctx.uiSessionId = retried.uiSessionId;
           resetStreamState();
+          activeStream = retried.stream;
           await readUpstream(retried.stream);
           if (toolParser?.isInsideTool()) sawToolCallSignal = true;
         }
@@ -505,6 +521,7 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
         const continued = await ctx.onAutoContinue(ctx.uiSessionId, targetResponseId || '');
         if (!continued) break;
         ctx.uiSessionId = continued.uiSessionId;
+        activeStream = continued.stream;
         bufferChunks = [];
         bufferLen = 0;
         lineStart = 0;
@@ -601,6 +618,8 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
       flushWrites();
       markHistoryComplete(ctx.uiSessionId);
     } finally {
+      if (clientSignal) clientSignal.removeEventListener('abort', onClientAbort);
+      releaseActiveStream('stream teardown');
       flushWrites();
       clearInterval(heartbeatInterval);
       removeStream(ctx.completionId);
