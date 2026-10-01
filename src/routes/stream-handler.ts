@@ -79,6 +79,27 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
     let guardActive = !!ctx.onDegenerateRetry || !!ctx.onToolCallRetry || !!ctx.onUpdateMemberRetry;
     let heldOutput = '';
 
+    let activeStream: ReadableStream | null = ctx.stream;
+    let activeReader: ReadableStreamDefaultReader<any> | null = null;
+    const clientSignal = (c.req.raw as any)?.signal as AbortSignal | undefined;
+    const clientAborted = () => !!clientSignal?.aborted;
+    const releaseActiveStream = (reason: string) => {
+      const r = activeReader;
+      const s = activeStream;
+      activeStream = null;
+      activeReader = null;
+      if (r) {
+        r.cancel(reason).catch(() => {});
+      } else {
+        s?.cancel(reason).catch(() => {});
+      }
+    };
+    const onClientAbort = () => releaseActiveStream('client aborted stream');
+    if (clientSignal) {
+      if (clientSignal.aborted) queueMicrotask(onClientAbort);
+      else clientSignal.addEventListener('abort', onClientAbort, { once: true });
+    }
+
     const releaseGuard = () => {
       if (!guardActive) return;
       guardActive = false;
@@ -262,33 +283,39 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
       };
 
       const readUpstream = async (stream: ReadableStream) => {
-        const reader = stream.getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const decoded = decoder.decode(value, { stream: true });
-          bufferChunks.push(decoded);
-          bufferLen += decoded.length;
+        const reader = stream.getReader() as ReadableStreamDefaultReader<any>;
+        activeReader = reader;
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const decoded = decoder.decode(value, { stream: true });
+            bufferChunks.push(decoded);
+            bufferLen += decoded.length;
 
-          if (decoded.includes('\n')) {
-            const fullBuffer = bufferChunks.length === 1 ? bufferChunks[0] : bufferChunks.join('');
-            processLines(fullBuffer);
+            if (decoded.includes('\n')) {
+              const fullBuffer = bufferChunks.length === 1 ? bufferChunks[0] : bufferChunks.join('');
+              processLines(fullBuffer);
 
-            const remaining = fullBuffer.substring(lineStart);
-            bufferChunks.length = 0;
-            if (remaining) {
-              bufferChunks.push(remaining);
-              bufferLen = remaining.length;
-            } else {
-              bufferLen = 0;
+              const remaining = fullBuffer.substring(lineStart);
+              bufferChunks.length = 0;
+              if (remaining) {
+                bufferChunks.push(remaining);
+                bufferLen = remaining.length;
+              } else {
+                bufferLen = 0;
+              }
+              lineStart = 0;
             }
-            lineStart = 0;
           }
-        }
 
-        if (bufferLen > 0) {
-          const finalBuffer = bufferChunks.length === 1 ? bufferChunks[0] : bufferChunks.join('');
-          processLines(finalBuffer);
+          if (bufferLen > 0) {
+            const finalBuffer = bufferChunks.length === 1 ? bufferChunks[0] : bufferChunks.join('');
+            processLines(finalBuffer);
+          }
+        } finally {
+          activeReader = null;
+          try { reader.releaseLock(); } catch { /* ignore */ }
         }
       };
 
@@ -433,11 +460,17 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
         emittedStreamingToolIds.size === 0 &&
         isDegenerateAnswer(lastFullContent)
       ) {
+        if (clientAborted()) return;
         console.warn(`[Chat] Streaming degenerate reply detected (${JSON.stringify(lastFullContent.slice(0, 40))}). Regenerating...`);
         const retried = await ctx.onDegenerateRetry();
         if (retried) {
+          if (clientAborted()) {
+            retried.stream.cancel('client aborted stream').catch(() => {});
+            return;
+          }
           ctx.uiSessionId = retried.uiSessionId;
           resetStreamState();
+          activeStream = retried.stream;
           await readUpstream(retried.stream);
           if (toolParser?.isInsideTool()) sawToolCallSignal = true;
         }
@@ -456,12 +489,18 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
         sawToolCallSignal &&
         guardActive
       ) {
+        if (clientAborted()) return;
         console.warn('[Chat] Tool call attempted but unparseable. Regenerating with corrective directive...');
         toolCallRetried = true;
         const retried = await ctx.onToolCallRetry();
         if (retried) {
+          if (clientAborted()) {
+            retried.stream.cancel('client aborted stream').catch(() => {});
+            return;
+          }
           ctx.uiSessionId = retried.uiSessionId;
           resetStreamState();
+          activeStream = retried.stream;
           await readUpstream(retried.stream);
           if (toolParser?.isInsideTool()) sawToolCallSignal = true;
         }
@@ -476,12 +515,18 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
         sawUpdateMemberSignal &&
         guardActive
       ) {
+        if (clientAborted()) return;
         console.warn('[Chat] Account membership limit hit. Retrying with another account...');
         updateMemberRetried = true;
         const retried = await ctx.onUpdateMemberRetry();
         if (retried) {
+          if (clientAborted()) {
+            retried.stream.cancel('client aborted stream').catch(() => {});
+            return;
+          }
           ctx.uiSessionId = retried.uiSessionId;
           resetStreamState();
+          activeStream = retried.stream;
           await readUpstream(retried.stream);
           if (toolParser?.isInsideTool()) sawToolCallSignal = true;
         }
@@ -502,9 +547,15 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
       ) {
         autoContinuesLeft--;
         console.warn(`[Chat] Truncated response detected (unclosed code fence or finish_reason=length). Auto-continuing stream (${config.autoContinue.maxContinues - autoContinuesLeft}/${config.autoContinue.maxContinues})...`);
+        if (clientAborted()) break;
         const continued = await ctx.onAutoContinue(ctx.uiSessionId, targetResponseId || '');
         if (!continued) break;
+        if (clientAborted()) {
+          continued.stream.cancel('client aborted stream').catch(() => {});
+          break;
+        }
         ctx.uiSessionId = continued.uiSessionId;
+        activeStream = continued.stream;
         bufferChunks = [];
         bufferLen = 0;
         lineStart = 0;
@@ -601,6 +652,8 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
       flushWrites();
       markHistoryComplete(ctx.uiSessionId);
     } finally {
+      if (clientSignal) clientSignal.removeEventListener('abort', onClientAbort);
+      releaseActiveStream('stream teardown');
       flushWrites();
       clearInterval(heartbeatInterval);
       removeStream(ctx.completionId);
